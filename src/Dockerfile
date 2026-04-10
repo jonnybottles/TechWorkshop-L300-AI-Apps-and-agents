@@ -26,6 +26,7 @@ EXPOSE 8000
 # Set environment variables (override in production)
 ENV PATH="/app/.venv/bin:$PATH"
 ENV PORT=8000
+ENV PYTHONUNBUFFERED=1
 
 # Start the FastAPI app
 CMD ["uvicorn", "chat_app:app", "--host", "0.0.0.0", "--port", "8000"]

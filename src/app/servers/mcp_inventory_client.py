@@ -27,6 +27,7 @@ class MCPShopperToolsClient:
         self._session: Optional[ClientSession] = None
         self._exit_stack: Optional[AsyncExitStack] = None
         self.available_tools: List[Dict[str, Any]] = []
+        self._lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Establish a persistent stdio connection to the MCP server."""
@@ -63,6 +64,13 @@ class MCPShopperToolsClient:
             await self.connect()
         return self._session
 
+    @staticmethod
+    def _is_connection_error(exc: Exception) -> bool:
+        """Check if an exception indicates a broken MCP connection."""
+        if isinstance(exc, (BrokenPipeError, ConnectionError, EOFError)):
+            return True
+        return "closed" in str(exc).lower()
+
     async def call_tool(self, tool_name: str, arguments: Dict[str, Any], timeout: float = 60.0) -> Any:
         """
         Call a tool on the MCP server using the persistent connection.
@@ -76,48 +84,64 @@ class MCPShopperToolsClient:
             The result from the tool call
         """
         import time as _time
-        session = await self._ensure_connected()
-        logger.info(f"Calling tool '{tool_name}' with arguments: {arguments}")
+        async with self._lock:
+            session = await self._ensure_connected()
+            logger.info(f"Calling tool '{tool_name}' with arguments: {arguments}")
 
-        start = _time.perf_counter()
-        result_data = await asyncio.wait_for(
-            session.call_tool(tool_name, arguments=arguments),
-            timeout=timeout,
-        )
-        elapsed = _time.perf_counter() - start
-        logger.info(f"[MCP] {tool_name} completed in {elapsed:.3f}s")
-
-        if result_data.content and len(result_data.content) > 0:
-            result = result_data.content[0].text
-        else:
-            result = str(result_data)
-
-        if isinstance(result, str):
+            start = _time.perf_counter()
             try:
-                return json.loads(result)
-            except (json.JSONDecodeError, ValueError):
-                return result
+                result_data = await asyncio.wait_for(
+                    session.call_tool(tool_name, arguments=arguments),
+                    timeout=timeout,
+                )
+            except Exception as e:
+                if self._is_connection_error(e):
+                    logger.warning(f"MCP connection lost, reconnecting: {e}")
+                    await self.close()
+                    await self.connect()
+                    session = self._session
+                    result_data = await asyncio.wait_for(
+                        session.call_tool(tool_name, arguments=arguments),
+                        timeout=timeout,
+                    )
+                else:
+                    raise
+            elapsed = _time.perf_counter() - start
+            logger.info(f"[MCP] {tool_name} completed in {elapsed:.3f}s")
 
-        return result
+            if result_data.content and len(result_data.content) > 0:
+                result = result_data.content[0].text
+            else:
+                result = str(result_data)
+
+            if isinstance(result, str):
+                try:
+                    return json.loads(result)
+                except (json.JSONDecodeError, ValueError):
+                    return result
+
+            return result
 
     async def list_tools(self) -> list:
         """List all available tools from the MCP server."""
-        session = await self._ensure_connected()
-        tools_result = await session.list_tools()
-        logger.info(f"Found {len(tools_result.tools)} tools")
-        return tools_result.tools
+        async with self._lock:
+            session = await self._ensure_connected()
+            tools_result = await session.list_tools()
+            logger.info(f"Found {len(tools_result.tools)} tools")
+            return tools_result.tools
 
     async def get_agent_prompt(self, agent_id: str) -> str:
         """Get the prompt template for a specific agent."""
-        session = await self._ensure_connected()
-        logger.info(f"Fetching prompt for agent ID: {agent_id}")
+        async with self._lock:
+            session = await self._ensure_connected()
+            logger.info(f"Fetching prompt for agent ID: {agent_id}")
 
-        prompt_result = await session.get_prompt("agentPrompt", {"agent_name": agent_id})
-        if prompt_result.messages:
-            return prompt_result.messages[0].content.text
-        else:
-            logger.warning(f"Prompt '{agent_id}' returned no messages")
-            return ""
+            prompt_result = await session.get_prompt("agentPrompt", {"agent_name": agent_id})
+            if prompt_result.messages:
+                return prompt_result.messages[0].content.text
+            else:
+                logger.warning(f"Prompt '{agent_id}' returned no messages")
+                return ""
 
     async def get_product_recommendations(self, question: str) -> List[Dict[str, Any]]:
         """Get product recommendations based on query."""
@@ -138,16 +162,18 @@ class MCPShopperToolsClient:
 
 # Singleton instance with persistent connection
 _mcp_client: Optional[MCPShopperToolsClient] = None
+_mcp_client_lock = asyncio.Lock()
 
 
 async def get_mcp_client() -> MCPShopperToolsClient:
     """Get or create the singleton MCP client with a persistent connection."""
     global _mcp_client
-    if _mcp_client is None:
-        _mcp_client = MCPShopperToolsClient()
-        await _mcp_client.connect()
-        _mcp_client.available_tools = await _mcp_client.list_tools()
-    return _mcp_client
+    async with _mcp_client_lock:
+        if _mcp_client is None:
+            _mcp_client = MCPShopperToolsClient()
+            await _mcp_client.connect()
+            _mcp_client.available_tools = await _mcp_client.list_tools()
+        return _mcp_client
 
 
 # Example usage and testing
